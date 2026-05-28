@@ -53,7 +53,6 @@ struct Config {
 /// Builder for `Connector`.
 pub struct ConnectorBuilder {
     config: Config,
-    #[cfg(feature = "socks")]
     resolver: DynResolver,
     http: HttpConnector,
     builder: TlsConnectorBuilder,
@@ -70,7 +69,6 @@ pub enum Connector {
 #[derive(Clone)]
 pub struct ConnectorService {
     config: Config,
-    #[cfg(feature = "socks")]
     resolver: DynResolver,
     tls: TlsConnector,
     http: HttpConnector,
@@ -139,7 +137,6 @@ impl ConnectorBuilder {
     ) -> crate::Result<Connector> {
         let mut service = ConnectorService {
             config: self.config,
-            #[cfg(feature = "socks")]
             resolver: self.resolver.clone(),
             http: self.http,
             tls: self
@@ -208,7 +205,6 @@ impl Connector {
                 tls_info: false,
                 timeout: None,
             },
-            #[cfg(feature = "socks")]
             resolver: resolver.clone(),
             http: HttpConnector::new(resolver, TcpConnector::new()),
             builder: TlsConnector::builder(),
@@ -355,6 +351,46 @@ impl ConnectorService {
         self.conn_from_stream(io, proxy)
     }
 
+    /// Resolve the destination host locally and return a URI whose authority is
+    /// the resolved IP address (port preserved). Used to pick the HTTP CONNECT
+    /// target when a proxy is configured with `resolve_local`. If the host is
+    /// already an IP literal, the original URI is returned unchanged.
+    async fn resolve_connect_dst(&self, uri: &http::Uri) -> Result<http::Uri, BoxError> {
+        use std::net::IpAddr;
+
+        use crate::dns::Name;
+
+        let host = uri
+            .host()
+            .ok_or_else(|| BoxError::from("missing destination host"))?;
+
+        // Already an IP literal (`host()` keeps the brackets for IPv6): nothing
+        // to resolve, tunnel straight to it.
+        let host_ip = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(host);
+        if host_ip.parse::<IpAddr>().is_ok() {
+            return Ok(uri.clone());
+        }
+
+        let port = uri.port_or_default();
+        let name = Name::new(host.into());
+        let mut addrs = self.resolver.clone().oneshot(name).await?;
+        let mut addr = addrs
+            .next()
+            .ok_or_else(|| BoxError::from(format!("no addresses found for {host}")))?;
+
+        // Use the destination port from the URI, never the resolver's (which may
+        // be synthetic or zero). `SocketAddr`'s `Display` brackets IPv6 for us.
+        addr.set_port(port);
+        let authority = addr.to_string();
+
+        let mut parts = uri.clone().into_parts();
+        parts.authority = Some(authority.parse()?);
+        http::Uri::from_parts(parts).map_err(Into::into)
+    }
+
     async fn connect_via_proxy(
         self,
         mut descriptor: ConnectionDescriptor,
@@ -419,6 +455,18 @@ impl ConnectorService {
                     // Build an HTTPS connector.
                     let mut connector = self.build_https_connector(is_https, &descriptor)?;
 
+                    // The CONNECT target. By default this is the original
+                    // destination (hostname and port), so the proxy performs DNS
+                    // resolution. When `resolve_local` is set, resolve the host with
+                    // our own resolver and send CONNECT to the resolved IP instead.
+                    // TLS SNI and the tunneled request keep using the original
+                    // hostname (carried by `req`).
+                    let connect_dst = if proxy.resolve_local() {
+                        self.resolve_connect_dst(&uri).await?
+                    } else {
+                        uri.clone()
+                    };
+
                     // Build a tunnel connector to establish the CONNECT tunnel.
                     let tunneled = {
                         let mut tunnel =
@@ -435,7 +483,7 @@ impl ConnectorService {
                         }
 
                         // Connect to the proxy and establish the tunnel.
-                        tunnel.call(uri).await?
+                        tunnel.call(connect_dst).await?
                     };
 
                     // Wrap the established tunneled stream with TLS.
